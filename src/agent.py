@@ -318,6 +318,20 @@ def parse_meal_info(user_input):
     return info
 
 
+def get_nutrition_for_inventory():
+    """获取冰箱食材的营养数据"""
+    items = db.get_inventory()
+    nutrition_lines = []
+
+    for item in items:
+        name = item['name']
+        nutrition = db.get_nutrition_summary(name)
+        if nutrition:
+            nutrition_lines.append(f"- {nutrition}")
+
+    return "\n".join(nutrition_lines) if nutrition_lines else None
+
+
 def generate_recommendation(meal_type, people_count):
     """
     生成菜谱推荐
@@ -339,8 +353,11 @@ def generate_recommendation(meal_type, people_count):
             "action": "inventory_empty"
         }
 
+    # 获取营养数据
+    nutrition_data = get_nutrition_for_inventory()
+
     # 构建 Prompt
-    prompt = build_recipe_prompt(inventory_summary, profile_summary, meal_type, people_count)
+    prompt = build_recipe_prompt(inventory_summary, profile_summary, meal_type, people_count, nutrition_data)
 
     # 调用 MiMo 生成菜谱
     result = call_mimo_text_with_json(prompt, RECIPE_SYSTEM)
@@ -385,17 +402,27 @@ def format_recommendation(meal_type, people_count, plans, plan_id):
 
         lines.append(f"━━━ {plan_name} ━━━")
 
+        total_calories = 0
+
         for dish in plan.get('dishes', []):
             lines.append(f"\n🥘 {dish['name']}")
             lines.append(f"   ⏱️ {dish.get('cooking_time', '未知')}")
 
-            # 食材
+            # 食材（带营养信息）
             ingredients = dish.get('ingredients', [])
             if ingredients:
                 ing_strs = []
                 for ing in ingredients:
                     if isinstance(ing, dict):
-                        ing_strs.append(f"{ing.get('name', '')}{ing.get('amount', '')}")
+                        name = ing.get('name', '')
+                        amount = ing.get('amount', '')
+                        ing_strs.append(f"{name}{amount}")
+
+                        # 尝试获取营养数据
+                        nutrition = db.get_nutrition_by_name(name)
+                        if nutrition and nutrition.get('energy_kcal'):
+                            # 简单估算热量（假设用量约100g）
+                            total_calories += nutrition['energy_kcal']
                     else:
                         ing_strs.append(str(ing))
                 lines.append(f"   🥬 {', '.join(ing_strs)}")
@@ -408,6 +435,9 @@ def format_recommendation(meal_type, people_count, plans, plan_id):
 
         if plan.get('total_time'):
             lines.append(f"\n   ⏰ 总用时：{plan['total_time']}")
+
+        if total_calories > 0:
+            lines.append(f"   🔥 预估热量：约{int(total_calories)}kcal")
 
         lines.append("")
 

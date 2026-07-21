@@ -84,6 +84,31 @@ def init_db():
         )
     ''')
 
+    # 营养成分表（中国食物成分表）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS nutrition_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            food_code TEXT,
+            food_name TEXT NOT NULL,
+            category TEXT,
+            edible REAL,
+            water REAL,
+            energy_kcal REAL,
+            energy_kj REAL,
+            protein REAL,
+            fat REAL,
+            cho REAL,
+            dietary_fiber REAL,
+            cholesterol REAL,
+            vitamin_a REAL,
+            vitamin_c REAL,
+            ca REAL,
+            fe REAL,
+            zn REAL,
+            UNIQUE(food_name)
+        )
+    ''')
+
     # 用餐时间配置表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meal_schedule (
@@ -422,24 +447,186 @@ def get_recent_conversations(session_id, limit=10):
     return [dict(row) for row in reversed(rows)]
 
 
+# ==================== 营养数据操作 ====================
+
+def import_nutrition_data(json_path):
+    """
+    从JSON文件导入营养数据
+
+    Args:
+        json_path: JSON文件路径
+
+    Returns:
+        int: 导入的记录数
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    with open(json_path, 'r', encoding='utf-8') as f:
+        foods = json.load(f)
+
+    imported = 0
+    for food in foods:
+        try:
+            # 提取分类（从foodCode推断或使用默认）
+            food_name = food.get('foodName', '')
+            food_code = food.get('foodCode', '')
+
+            # 解析数值，处理 "—" 和 "Tr" 等非数字值
+            def parse_num(val):
+                if val is None or val == '—' or val == 'Tr' or val == '':
+                    return None
+                try:
+                    return float(val)
+                except:
+                    return None
+
+            cursor.execute('''
+                INSERT OR IGNORE INTO nutrition_data
+                (food_code, food_name, edible, water, energy_kcal, energy_kj,
+                 protein, fat, cho, dietary_fiber, cholesterol,
+                 vitamin_a, vitamin_c, ca, fe, zn)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                food_code,
+                food_name,
+                parse_num(food.get('edible')),
+                parse_num(food.get('water')),
+                parse_num(food.get('energyKCal')),
+                parse_num(food.get('energyKJ')),
+                parse_num(food.get('protein')),
+                parse_num(food.get('fat')),
+                parse_num(food.get('CHO')),
+                parse_num(food.get('dietaryFiber')),
+                parse_num(food.get('cholesterol')),
+                parse_num(food.get('vitaminA')),
+                parse_num(food.get('vitaminC')),
+                parse_num(food.get('Ca')),
+                parse_num(food.get('Fe')),
+                parse_num(food.get('Zn'))
+            ))
+            imported += 1
+        except Exception as e:
+            print(f"导入失败: {food.get('foodName', '未知')} - {e}")
+
+    conn.commit()
+    conn.close()
+    return imported
+
+
+def search_nutrition(keyword, limit=5):
+    """
+    搜索营养数据
+
+    Args:
+        keyword: 搜索关键词
+        limit: 返回数量
+
+    Returns:
+        list: 匹配的营养数据
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT * FROM nutrition_data
+        WHERE food_name LIKE ?
+        ORDER BY
+            CASE WHEN food_name = ? THEN 0
+                 WHEN food_name LIKE ? THEN 1
+                 ELSE 2 END,
+            food_name
+        LIMIT ?
+    ''', (f'%{keyword}%', keyword, f'{keyword}%', limit))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_nutrition_by_name(food_name):
+    """
+    精确获取营养数据
+
+    Args:
+        food_name: 食物名称
+
+    Returns:
+        dict: 营养数据或None
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # 先精确匹配
+    cursor.execute('SELECT * FROM nutrition_data WHERE food_name = ?', (food_name,))
+    row = cursor.fetchone()
+
+    if not row:
+        # 模糊匹配
+        cursor.execute('SELECT * FROM nutrition_data WHERE food_name LIKE ? LIMIT 1', (f'%{food_name}%',))
+        row = cursor.fetchone()
+
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_nutrition_summary(food_name):
+    """
+    获取食物营养摘要（用于Prompt）
+
+    Args:
+        food_name: 食物名称
+
+    Returns:
+        str: 营养摘要文本
+    """
+    data = get_nutrition_by_name(food_name)
+    if not data:
+        return None
+
+    parts = [data['food_name']]
+    if data.get('energy_kcal'):
+        parts.append(f"{data['energy_kcal']}kcal/100g")
+    if data.get('protein'):
+        parts.append(f"蛋白质{data['protein']}g")
+    if data.get('fat'):
+        parts.append(f"脂肪{data['fat']}g")
+    if data.get('cho'):
+        parts.append(f"碳水{data['cho']}g")
+
+    return "，".join(parts)
+
+
+def get_nutrition_count():
+    """获取营养数据总数"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM nutrition_data')
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
 if __name__ == '__main__':
+    import sys
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
     # 初始化数据库
     init_db()
     print("数据库初始化完成")
 
-    # 测试添加成员
-    add_member("爸爸", dislikes_taste=["辣"])
-    add_member("孩子", dislikes_main=["苦瓜"], dislikes_ingredient=["葱"])
-    print("添加成员完成")
+    # 导入营养数据
+    nutrition_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'nutrition', 'china_food_composition.json')
+    if os.path.exists(nutrition_path):
+        count = import_nutrition_data(nutrition_path)
+        print(f"营养数据导入完成: {count}条")
+        print(f"营养数据总数: {get_nutrition_count()}条")
+    else:
+        print(f"营养数据文件不存在: {nutrition_path}")
 
-    # 测试添加库存
-    add_inventory_item("鸡蛋", "蛋类", 6, "个", expiry_date="2026-08-15")
-    add_inventory_item("西红柿", "蔬菜", 3, "个", expiry_date="2026-08-05")
-    print("添加库存完成")
-
-    # 测试查询
-    print("\n家庭画像：")
-    print(get_profile_summary())
-
-    print("\n冰箱库存：")
-    print(get_inventory_summary())
+    # 测试搜索
+    print("\n搜索'鸡蛋':")
+    results = search_nutrition("鸡蛋")
+    for r in results:
+        print(f"  {r['food_name']}: {r['energy_kcal']}kcal, 蛋白质{r['protein']}g, 脂肪{r['fat']}g")
