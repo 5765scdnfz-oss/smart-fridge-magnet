@@ -9,6 +9,7 @@ import tempfile
 from . import database as db
 from .recognition import process_photo
 from .agent import chat, confirm_plan, handle_inventory_query
+from .intent_parser import parse_query, build_nutrition_query, build_category_query, get_suggestions, is_simple_query, extract_food_name
 from .scheduler import (
     init_scheduler, stop_scheduler,
     get_notifications, mark_notification_read, clear_notifications,
@@ -27,12 +28,20 @@ db.init_db()
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
     """
-    对话接口
+    对话接口 — 支持本地语义理解优先
 
     请求：
     {
         "message": "用户输入",
         "session_id": "会话ID（可选）"
+    }
+
+    响应：
+    {
+        "response": "回复文本",
+        "handled_locally": true/false,
+        "intent": {...},
+        "results": [...]
     }
     """
     data = request.get_json()
@@ -42,7 +51,75 @@ def api_chat():
     message = data['message']
     session_id = data.get('session_id', 'default')
 
+    # 1. 先尝试本地语义理解
+    parsed = parse_query(message)
+
+    if is_simple_query(message):
+        # 简单查询，本地处理
+        response = {
+            "handled_locally": True,
+            "intent": parsed,
+            "response": "",
+            "results": []
+        }
+
+        if parsed["type"] == "nutrition":
+            try:
+                nutrition_query = build_nutrition_query(parsed["intent"])
+                results = db.get_nutrition_by_field(
+                    order_by=nutrition_query["order_by"],
+                    order=nutrition_query["order"],
+                    limit=nutrition_query["limit"]
+                )
+                response["results"] = results
+                label = parsed["intent"].get("label", "相关")
+                response["response"] = f"找到 {len(results)} 个{label}食物：\n"
+                for i, r in enumerate(results, 1):
+                    response["response"] += f"{i}. {r['food_name']}: {r.get(parsed['intent']['field'], '?')}g\n"
+            except Exception as e:
+                response["response"] = f"查询出错: {str(e)}"
+
+        elif parsed["type"] == "category":
+            category = parsed["intent"].get("category", "")
+            results = db.get_inventory_by_category(category)
+            response["results"] = results
+            if results:
+                response["response"] = f"找到 {len(results)} 个{category}类食材：\n"
+                for r in results:
+                    response["response"] += f"- {r['name']} × {r['quantity']}{r['unit']}\n"
+            else:
+                response["response"] = f"库存中没有{category}类食材"
+
+        elif parsed["type"] == "inventory":
+            if parsed["intent"].get("filter") == "expiring_soon":
+                results = db.get_expiring_items(days=3)
+                response["results"] = results
+                if results:
+                    response["response"] = f"有 {len(results)} 个食材即将过期：\n"
+                    for r in results:
+                        days = r.get('days_left', '?')
+                        response["response"] += f"- {r['name']}: {days}天后过期\n"
+                else:
+                    response["response"] = "没有即将过期的食材"
+
+        elif parsed["type"] == "action" and parsed["intent"].get("action") == "query":
+            food_name = extract_food_name(message)
+            if food_name:
+                inventory = db.get_inventory(page_size=1000)["items"]
+                matched = [i for i in inventory if food_name in i.get("name", "")]
+                if matched:
+                    response["results"] = matched
+                    response["response"] = f"库存中有 {food_name}：\n"
+                    for r in matched:
+                        response["response"] += f"- {r['name']} × {r['quantity']}{r['unit']}\n"
+                else:
+                    response["response"] = f"库存中没有找到 {food_name}"
+
+        return jsonify(response)
+
+    # 2. 复杂查询，调用 AI
     result = chat(message, session_id)
+    result["handled_locally"] = False
     return jsonify(result)
 
 
@@ -312,6 +389,173 @@ def api_inventory_categories():
         "categories": categories,
         "count": len(categories)
     })
+
+
+# ==================== 智能查询接口 ====================
+
+@app.route('/api/smart/query', methods=['POST'])
+def api_smart_query():
+    """
+    智能查询接口 — 本地语义理解，减少 AI 调用
+
+    请求：
+    {
+        "query": "蛋白质高的食物"
+    }
+
+    返回：
+    {
+        "type": "nutrition",
+        "intent": {"field": "protein", "order": "DESC", "label": "高蛋白"},
+        "keywords": ["蛋白质"],
+        "confidence": "high",
+        "results": [...],
+        "suggestions": [...],
+        "handled_locally": true
+    }
+    """
+    data = request.get_json()
+    if not data or 'query' not in data:
+        return jsonify({"error": "缺少query参数"}), 400
+
+    query = data['query']
+
+    # 本地语义解析
+    parsed = parse_query(query)
+
+    response = {
+        "type": parsed["type"],
+        "intent": parsed["intent"],
+        "keywords": parsed["keywords"],
+        "confidence": parsed["confidence"],
+        "original": parsed["original"],
+        "handled_locally": False,
+        "results": [],
+        "suggestions": []
+    }
+
+    # 根据意图类型处理
+    if parsed["type"] == "nutrition":
+        # 营养查询：按字段排序
+        try:
+            nutrition_query = build_nutrition_query(parsed["intent"])
+            results = db.get_nutrition_by_field(
+                order_by=nutrition_query["order_by"],
+                order=nutrition_query["order"],
+                limit=nutrition_query["limit"]
+            )
+            response["results"] = results
+            response["handled_locally"] = True
+            response["message"] = f"找到 {len(results)} 个{parsed['intent'].get('label', '')}食物"
+        except Exception as e:
+            response["error"] = str(e)
+
+    elif parsed["type"] == "category":
+        # 分类查询
+        category_query = build_category_query(parsed["intent"])
+        results = db.get_inventory_by_category(category_query["category"])
+        response["results"] = results
+        response["handled_locally"] = True
+        response["message"] = f"找到 {len(results)} 个{category_query['category']}类食材"
+
+    elif parsed["type"] == "inventory":
+        # 库存查询
+        if parsed["intent"].get("filter") == "expiring_soon":
+            results = db.get_expiring_items(days=3)
+            response["results"] = results
+            response["handled_locally"] = True
+            response["message"] = f"找到 {len(results)} 个即将过期的食材"
+        elif parsed["intent"].get("sort") == "quantity":
+            order = parsed["intent"].get("order", "ASC")
+            all_items = db.get_inventory(page_size=1000)["items"]
+            all_items.sort(key=lambda x: x.get("quantity", 0), reverse=(order == "DESC"))
+            response["results"] = all_items[:10]
+            response["handled_locally"] = True
+
+    elif parsed["type"] == "action":
+        action = parsed["intent"].get("action", "")
+        if action == "query":
+            # 查询类动作，提取食材名
+            food_name = extract_food_name(query)
+            if food_name:
+                # 先查库存
+                inventory = db.get_inventory(page_size=1000)["items"]
+                matched = [i for i in inventory if food_name in i.get("name", "")]
+                if matched:
+                    response["results"] = matched
+                    response["handled_locally"] = True
+                    response["message"] = f"找到 {len(matched)} 个匹配的库存项"
+                else:
+                    # 查营养数据
+                    nutrition = db.search_nutrition(food_name, limit=5)
+                    if nutrition:
+                        response["results"] = nutrition
+                        response["handled_locally"] = True
+                        response["message"] = f"找到 {len(nutrition)} 个匹配的食物"
+
+    # 生成建议
+    inventory = db.get_inventory(page_size=1000)["items"] if parsed["type"] in ["action", "scene"] else None
+    response["suggestions"] = get_suggestions(query, inventory)
+
+    return jsonify(response)
+
+
+@app.route('/api/smart/nutrition', methods=['GET'])
+def api_smart_nutrition():
+    """
+    营养排序查询
+
+    查询参数：
+    - field: 排序字段 (protein/fat/energy_kcal/fe/ca/vitamin_a/vitamin_c)
+    - order: 排序方向 (ASC/DESC，默认DESC)
+    - limit: 返回数量（默认5）
+    """
+    field = request.args.get('field', 'protein')
+    order = request.args.get('order', 'DESC').upper()
+    limit = int(request.args.get('limit', 5))
+
+    try:
+        results = db.get_nutrition_by_field(order_by=field, order=order, limit=limit)
+        return jsonify({
+            "field": field,
+            "order": order,
+            "results": results,
+            "count": len(results)
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/smart/parse', methods=['POST'])
+def api_smart_parse():
+    """
+    仅解析意图（不执行查询）
+
+    请求：
+    {
+        "query": "蛋白质高的食物"
+    }
+
+    返回：
+    {
+        "type": "nutrition",
+        "intent": {...},
+        "keywords": [...],
+        "confidence": "high",
+        "is_simple": true
+    }
+    """
+    data = request.get_json()
+    if not data or 'query' not in data:
+        return jsonify({"error": "缺少query参数"}), 400
+
+    query = data['query']
+    parsed = parse_query(query)
+    parsed["is_simple"] = is_simple_query(query)
+
+    return jsonify(parsed)
 
 
 @app.route('/api/profile', methods=['GET'])

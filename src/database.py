@@ -989,6 +989,89 @@ def search_nutrition(keyword, limit=5):
     return [dict(row) for row in rows]
 
 
+def get_nutrition_by_field(order_by='protein', order='DESC', limit=5, exclude_null=True):
+    """
+    按营养字段排序查询
+
+    Args:
+        order_by: 排序字段 (protein/fat/energy_kcal/fe/ca/vitamin_a/vitamin_c/dietary_fiber/cholesterol/cho)
+        order: 排序方向 (ASC/DESC)
+        limit: 返回数量
+        exclude_null: 是否排除空值
+
+    Returns:
+        list: 营养数据列表
+    """
+    # 允许的排序字段（防止 SQL 注入）
+    allowed_fields = {
+        'protein', 'fat', 'energy_kcal', 'energy_kj', 'fe', 'ca',
+        'vitamin_a', 'vitamin_c', 'dietary_fiber', 'cholesterol', 'cho',
+        'water', 'edible'
+    }
+
+    if order_by not in allowed_fields:
+        raise ValueError(f"不允许的排序字段: {order_by}")
+
+    if order not in ('ASC', 'DESC'):
+        raise ValueError(f"排序方向必须是 ASC 或 DESC")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # 构建查询
+    where_clause = f"WHERE {order_by} IS NOT NULL" if exclude_null else ""
+    sql = f'''
+        SELECT food_name, {order_by}, energy_kcal, protein, fat, cho
+        FROM nutrition_data
+        {where_clause}
+        ORDER BY {order_by} {order}
+        LIMIT ?
+    '''
+
+    cursor.execute(sql, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def get_inventory_by_category(category):
+    """
+    按分类获取库存
+
+    Args:
+        category: 分类名称
+
+    Returns:
+        list: 库存项列表
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT * FROM fridge_inventory
+        WHERE category = ? AND quantity > 0
+        ORDER BY expiry_date
+    ''', (category,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    items = []
+    for row in rows:
+        item = dict(row)
+        if item.get('expiry_date'):
+            try:
+                from datetime import datetime
+                exp = datetime.strptime(item['expiry_date'], '%Y-%m-%d')
+                item['days_left'] = (exp - datetime.now()).days
+            except:
+                item['days_left'] = None
+        items.append(item)
+
+    return items
+
+
 def get_nutrition_by_name(food_name):
     """
     精确获取营养数据

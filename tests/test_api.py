@@ -363,6 +363,139 @@ def test_inventory_summary():
     print()
 
 
+# ==================== 智能查询测试 ====================
+
+def test_smart_query_nutrition():
+    """测试智能查询 — 营养意图"""
+    print("=== 测试智能查询 — 营养意图 ===")
+
+    test_cases = [
+        "蛋白质高的食物",
+        "补铁的",
+        "低热量",
+        "高钙食物"
+    ]
+
+    for query in test_cases:
+        resp = requests.post(f'{BASE_URL}/smart/query', json={"query": query})
+        data = resp.json()
+        print(f"查询: {query}")
+        print(f"  类型: {data.get('type')}")
+        print(f"  意图: {data.get('intent', {}).get('label', '')}")
+        print(f"  本地处理: {data.get('handled_locally')}")
+        print(f"  结果数: {len(data.get('results', []))}")
+        if data.get('results'):
+            print(f"  第一个: {data['results'][0].get('food_name', '')}")
+        print()
+
+
+def test_smart_query_category():
+    """测试智能查询 — 分类意图"""
+    print("=== 测试智能查询 — 分类意图 ===")
+
+    test_cases = ["蔬菜类", "肉类", "乳制品"]
+
+    for query in test_cases:
+        resp = requests.post(f'{BASE_URL}/smart/query', json={"query": query})
+        data = resp.json()
+        print(f"查询: {query}")
+        print(f"  类型: {data.get('type')}")
+        print(f"  分类: {data.get('intent', {}).get('category', '')}")
+        print(f"  本地处理: {data.get('handled_locally')}")
+        print(f"  结果数: {len(data.get('results', []))}")
+        print()
+
+
+def test_smart_query_inventory():
+    """测试智能查询 — 库存意图"""
+    print("=== 测试智能查询 — 库存意图 ===")
+
+    resp = requests.post(f'{BASE_URL}/smart/query', json={"query": "快过期的"})
+    data = resp.json()
+    print(f"查询: 快过期的")
+    print(f"  类型: {data.get('type')}")
+    print(f"  本地处理: {data.get('handled_locally')}")
+    print(f"  结果数: {len(data.get('results', []))}")
+    print()
+
+
+def test_smart_query_action():
+    """测试智能查询 — 动作意图"""
+    print("=== 测试智能查询 — 动作意图 ===")
+
+    resp = requests.post(f'{BASE_URL}/smart/query', json={"query": "还有多少鸡蛋"})
+    data = resp.json()
+    print(f"查询: 还有多少鸡蛋")
+    print(f"  类型: {data.get('type')}")
+    print(f"  本地处理: {data.get('handled_locally')}")
+    print(f"  结果数: {len(data.get('results', []))}")
+    print()
+
+
+def test_smart_nutrition_api():
+    """测试营养排序 API"""
+    print("=== 测试营养排序 API ===")
+
+    test_cases = [
+        ("protein", "DESC", "高蛋白"),
+        ("fat", "ASC", "低脂肪"),
+        ("energy_kcal", "ASC", "低热量"),
+        ("fe", "DESC", "高铁"),
+    ]
+
+    for field, order, label in test_cases:
+        resp = requests.get(f'{BASE_URL}/smart/nutrition?field={field}&order={order}&limit=3')
+        data = resp.json()
+        print(f"查询: {label} (field={field}, order={order})")
+        print(f"  结果数: {data.get('count', 0)}")
+        if data.get('results'):
+            top = data['results'][0]
+            print(f"  第一: {top.get('food_name', '')} ({field}={top.get(field, '?')})")
+        print()
+
+
+def test_smart_parse():
+    """测试意图解析"""
+    print("=== 测试意图解析 ===")
+
+    test_cases = [
+        "蛋白质高的食物",
+        "蔬菜类",
+        "快过期的",
+        "推荐晚餐",
+        "孩子吃什么好",
+        "今天天气怎么样"
+    ]
+
+    for query in test_cases:
+        resp = requests.post(f'{BASE_URL}/smart/parse', json={"query": query})
+        data = resp.json()
+        print(f"查询: {query}")
+        print(f"  类型: {data.get('type')}")
+        print(f"  置信度: {data.get('confidence')}")
+        print(f"  简单查询: {data.get('is_simple')}")
+        print()
+
+
+def test_chat_with_local_understanding():
+    """测试对话接口的本地理解"""
+    print("=== 测试对话接口 — 本地理解 ===")
+
+    test_cases = [
+        "蛋白质高的食物",
+        "蔬菜类",
+        "快过期的"
+    ]
+
+    for query in test_cases:
+        resp = requests.post(f'{BASE_URL}/chat', json={"message": query})
+        data = resp.json()
+        print(f"查询: {query}")
+        print(f"  本地处理: {data.get('handled_locally')}")
+        print(f"  响应: {data.get('response', '')[:80]}...")
+        print()
+
+
 def run_all_tests():
     """运行所有测试"""
     print("🧪 开始测试...\n")
@@ -417,6 +550,16 @@ def run_all_tests():
         # 删除测试
         print("\n🗑️ 删除操作测试...\n")
         test_inventory_delete(item_id)
+
+        # 智能查询测试
+        print("\n🧠 智能查询测试...\n")
+        test_smart_query_nutrition()
+        test_smart_query_category()
+        test_smart_query_inventory()
+        test_smart_query_action()
+        test_smart_nutrition_api()
+        test_smart_parse()
+        test_chat_with_local_understanding()
 
         print("✅ 所有测试完成")
 
