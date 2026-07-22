@@ -10,10 +10,31 @@ from . import database as db
 from .recognition import process_photo
 from .agent import chat, confirm_plan, handle_inventory_query
 from .intent_parser import parse_query, build_nutrition_query, build_category_query, get_suggestions, is_simple_query, extract_food_name
+
+# 通知系统
+from .notification import (
+    get_notifications, get_unread_count, mark_read, mark_all_read,
+    clear_notifications, get_notification_stats
+)
+
+# 定时任务
 from .scheduler import (
-    init_scheduler, stop_scheduler,
-    get_notifications, mark_notification_read, clear_notifications,
-    trigger_recommendation
+    init_scheduler, stop_scheduler, is_scheduler_running,
+    get_scheduler_tasks, get_task_history,
+    trigger_recommendation, trigger_expiring_check, trigger_inventory_check
+)
+
+# 库存历史
+from .inventory_history import (
+    get_history, get_item_history, get_deduct_history, get_add_history,
+    get_statistics, get_daily_summary
+)
+
+# 健康检查
+from .health import (
+    full_health_check, quick_health_check,
+    check_database, check_api, check_scheduler,
+    check_inventory, check_profile, check_nutrition
 )
 
 app = Flask(__name__)
@@ -740,36 +761,110 @@ def api_confirm():
 
 @app.route('/api/notifications', methods=['GET'])
 def api_notifications():
-    """获取通知"""
+    """
+    获取通知
+
+    查询参数：
+    - unread_only: 是否只返回未读（默认true）
+    - type: 按类型筛选（可选）
+    """
     unread_only = request.args.get('unread_only', 'true').lower() == 'true'
-    notifications = get_notifications(unread_only)
+    notif_type = request.args.get('type')
+
+    if notif_type:
+        from .notification import NotificationType, notification_manager
+        try:
+            ntype = NotificationType(notif_type)
+            notifications = notification_manager.get_by_type(ntype, unread_only=unread_only)
+        except ValueError:
+            notifications = []
+    else:
+        notifications = get_notifications(unread_only)
+
     return jsonify({
         "notifications": notifications,
-        "count": len(notifications)
+        "count": len(notifications),
+        "unread_count": get_unread_count()
     })
 
 
-@app.route('/api/notifications/read', methods=['POST'])
-def api_notification_read():
+@app.route('/api/notifications/<notification_id>/read', methods=['POST'])
+def api_notification_read(notification_id):
     """标记通知为已读"""
-    data = request.get_json()
-    index = data.get('index', 0)
-    mark_notification_read(index)
-    return jsonify({"success": True})
+    success = mark_read(notification_id)
+    return jsonify({"success": success})
+
+
+@app.route('/api/notifications/read-all', methods=['POST'])
+def api_notification_read_all():
+    """标记所有通知为已读"""
+    count = mark_all_read()
+    return jsonify({"success": True, "count": count})
 
 
 @app.route('/api/notifications/clear', methods=['POST'])
 def api_notification_clear():
-    """清空通知"""
-    clear_notifications()
-    return jsonify({"success": True})
+    """
+    清空通知
+
+    请求：
+    {
+        "type": "recipe"  // 可选，指定类型清空
+    }
+    """
+    data = request.get_json() or {}
+    notif_type = data.get('type')
+
+    count = clear_notifications(notif_type)
+    return jsonify({"success": True, "count": count})
+
+
+@app.route('/api/notifications/stats', methods=['GET'])
+def api_notification_stats():
+    """获取通知统计"""
+    stats = get_notification_stats()
+    return jsonify(stats)
 
 
 # ==================== 定时任务接口 ====================
 
-@app.route('/api/scheduler/trigger', methods=['POST'])
+@app.route('/api/scheduler/status', methods=['GET'])
+def api_scheduler_status():
+    """获取定时任务状态"""
+    return jsonify({
+        "running": is_scheduler_running(),
+        "tasks": get_scheduler_tasks(),
+        "history_count": len(get_task_history())
+    })
+
+
+@app.route('/api/scheduler/tasks', methods=['GET'])
+def api_scheduler_tasks():
+    """获取所有定时任务"""
+    return jsonify({
+        "tasks": get_scheduler_tasks()
+    })
+
+
+@app.route('/api/scheduler/history', methods=['GET'])
+def api_scheduler_history():
+    """获取任务执行历史"""
+    return jsonify({
+        "history": get_task_history()
+    })
+
+
+@app.route('/api/scheduler/trigger/recommend', methods=['POST'])
 def api_trigger_recommendation():
-    """手动触发推荐（测试用）"""
+    """
+    手动触发推荐
+
+    请求：
+    {
+        "meal_type": "晚餐",  // 可选
+        "people_count": 3     // 可选
+    }
+    """
     data = request.get_json() or {}
     meal_type = data.get('meal_type')
     people_count = data.get('people_count')
@@ -778,16 +873,140 @@ def api_trigger_recommendation():
     return jsonify(result)
 
 
-# ==================== 健康检查 ====================
+@app.route('/api/scheduler/trigger/expiring', methods=['POST'])
+def api_trigger_expiring():
+    """手动触发过期检查"""
+    result = trigger_expiring_check()
+    return jsonify(result)
+
+
+@app.route('/api/scheduler/trigger/inventory', methods=['POST'])
+def api_trigger_inventory():
+    """手动触发库存检查"""
+    result = trigger_inventory_check()
+    return jsonify(result)
+
+
+# ==================== 库存历史接口 ====================
+
+@app.route('/api/inventory/history', methods=['GET'])
+def api_inventory_history():
+    """
+    获取库存历史
+
+    查询参数：
+    - item_id: 按库存项筛选（可选）
+    - action: 按动作筛选（add/deduct/update/delete）
+    - days: 查询最近N天（默认7）
+    - limit: 返回数量（默认100）
+    """
+    item_id = request.args.get('item_id', type=int)
+    action = request.args.get('action')
+    days = int(request.args.get('days', 7))
+    limit = int(request.args.get('limit', 100))
+
+    history = get_history(item_id=item_id, action=action, days=days, limit=limit)
+    return jsonify({
+        "history": history,
+        "count": len(history)
+    })
+
+
+@app.route('/api/inventory/history/<int:item_id>', methods=['GET'])
+def api_inventory_item_history(item_id):
+    """获取特定库存项的历史"""
+    limit = int(request.args.get('limit', 20))
+    history = get_item_history(item_id, limit=limit)
+    return jsonify({
+        "item_id": item_id,
+        "history": history,
+        "count": len(history)
+    })
+
+
+@app.route('/api/inventory/history/statistics', methods=['GET'])
+def api_inventory_statistics():
+    """
+    获取库存统计
+
+    查询参数：
+    - days: 统计最近N天（默认7）
+    """
+    days = int(request.args.get('days', 7))
+    stats = get_statistics(days=days)
+    return jsonify(stats)
+
+
+@app.route('/api/inventory/history/daily', methods=['GET'])
+def api_inventory_daily():
+    """
+    获取每日摘要
+
+    查询参数：
+    - days: 统计最近N天（默认7）
+    """
+    days = int(request.args.get('days', 7))
+    daily = get_daily_summary(days=days)
+    return jsonify({
+        "daily": daily,
+        "count": len(daily)
+    })
+
+
+# ==================== 健康检查接口 ====================
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """健康检查"""
-    return jsonify({
-        "status": "ok",
-        "service": "smart-fridge-magnet",
-        "version": "1.0.0"
-    })
+    """
+    健康检查
+
+    查询参数：
+    - full: 是否完整检查（默认false，只做快速检查）
+    """
+    full = request.args.get('full', 'false').lower() == 'true'
+
+    if full:
+        result = full_health_check()
+    else:
+        result = quick_health_check()
+
+    return jsonify(result)
+
+
+@app.route('/api/health/database', methods=['GET'])
+def health_database():
+    """数据库检查"""
+    return jsonify(check_database())
+
+
+@app.route('/api/health/api', methods=['GET'])
+def health_api():
+    """API 检查"""
+    return jsonify(check_api())
+
+
+@app.route('/api/health/scheduler', methods=['GET'])
+def health_scheduler():
+    """定时任务检查"""
+    return jsonify(check_scheduler())
+
+
+@app.route('/api/health/inventory', methods=['GET'])
+def health_inventory():
+    """库存检查"""
+    return jsonify(check_inventory())
+
+
+@app.route('/api/health/profile', methods=['GET'])
+def health_profile():
+    """画像检查"""
+    return jsonify(check_profile())
+
+
+@app.route('/api/health/nutrition', methods=['GET'])
+def health_nutrition():
+    """营养数据检查"""
+    return jsonify(check_nutrition())
 
 
 # ==================== 启动 ====================
