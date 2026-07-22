@@ -245,11 +245,27 @@ def add_inventory_item(name, category, quantity, unit='个',
     return item_id
 
 
-def get_inventory():
-    """获取所有库存"""
+def get_inventory(category=None):
+    """
+    获取库存
+
+    Args:
+        category: 按分类筛选（可选）
+
+    Returns:
+        list: 库存项列表
+    """
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM fridge_inventory WHERE quantity > 0 ORDER BY expiry_date')
+
+    if category:
+        cursor.execute(
+            'SELECT * FROM fridge_inventory WHERE quantity > 0 AND category = ? ORDER BY expiry_date',
+            (category,)
+        )
+    else:
+        cursor.execute('SELECT * FROM fridge_inventory WHERE quantity > 0 ORDER BY expiry_date')
+
     rows = cursor.fetchall()
     conn.close()
 
@@ -267,6 +283,87 @@ def get_inventory():
             item['days_left'] = None
         items.append(item)
     return items
+
+
+def update_inventory_item(item_id, **kwargs):
+    """
+    更新库存项
+
+    Args:
+        item_id: 库存项ID
+        **kwargs: 要更新的字段
+
+    Raises:
+        ValueError: 库存项不存在
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # 检查是否存在
+    cursor.execute('SELECT id FROM fridge_inventory WHERE id = ?', (item_id,))
+    if not cursor.fetchone():
+        conn.close()
+        raise ValueError(f"库存项 #{item_id} 不存在")
+
+    # 构建更新语句
+    allowed_fields = {'name', 'category', 'quantity', 'unit', 'production_date',
+                      'expiry_date', 'confidence', 'photo_path'}
+    set_clauses = []
+    values = []
+
+    for key, value in kwargs.items():
+        if key in allowed_fields:
+            set_clauses.append(f"{key} = ?")
+            values.append(value)
+
+    if not set_clauses:
+        conn.close()
+        raise ValueError("没有有效的更新字段")
+
+    set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+    values.append(item_id)
+
+    sql = f"UPDATE fridge_inventory SET {', '.join(set_clauses)} WHERE id = ?"
+    cursor.execute(sql, values)
+    conn.commit()
+    conn.close()
+
+
+def delete_inventory_item(item_id):
+    """
+    删除库存项（软删除，设为quantity=0）
+
+    Args:
+        item_id: 库存项ID
+
+    Raises:
+        ValueError: 库存项不存在
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # 检查是否存在
+    cursor.execute('SELECT id FROM fridge_inventory WHERE id = ?', (item_id,))
+    if not cursor.fetchone():
+        conn.close()
+        raise ValueError(f"库存项 #{item_id} 不存在")
+
+    cursor.execute(
+        'UPDATE fridge_inventory SET quantity = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        (item_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_inventory_categories():
+    """获取所有库存分类"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT category FROM fridge_inventory WHERE quantity > 0 ORDER BY category')
+    rows = cursor.fetchall()
+    conn.close()
+    return [row['category'] for row in rows]
 
 
 def get_inventory_summary():
