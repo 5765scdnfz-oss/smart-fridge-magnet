@@ -85,20 +85,24 @@ def api_inventory():
     查询参数：
     - format: "summary" 返回摘要文本，"full" 返回完整数据（默认full）
     - category: 按分类筛选（可选）
+    - page: 页码（默认1）
+    - page_size: 每页数量（默认50，最大200）
     """
     fmt = request.args.get('format', 'full')
     category = request.args.get('category')
+    page = int(request.args.get('page', 1))
+    page_size = min(int(request.args.get('page_size', 50)), 200)
 
     if fmt == 'summary':
         summary = db.get_inventory_summary()
         return jsonify({"summary": summary})
     else:
-        items = db.get_inventory(category=category)
-        return jsonify({
-            "items": items,
-            "total": len(items),
-            "expiring_soon": [i for i in items if i.get('days_left') is not None and i['days_left'] <= 3]
-        })
+        result = db.get_inventory(category=category, page=page, page_size=page_size)
+        result['expiring_soon'] = [
+            i for i in result['items']
+            if i.get('days_left') is not None and i['days_left'] <= 3
+        ]
+        return jsonify(result)
 
 
 @app.route('/api/inventory', methods=['POST'])
@@ -109,11 +113,11 @@ def api_inventory_add():
     请求：
     {
         "name": "鸡蛋",
-        "category": "蛋类",
+        "category": "蛋类",         // 必须在预设分类中
         "quantity": 10,
         "unit": "个",
-        "production_date": "2026-07-20",  // 可选
-        "expiry_date": "2026-08-20",      // 可选
+        "production_date": "2026-07-20",  // 可选，格式 YYYY-MM-DD
+        "expiry_date": "2026-08-20",      // 可选，格式 YYYY-MM-DD
         "confidence": "高"                // 可选，默认"高"
     }
     """
@@ -143,6 +147,8 @@ def api_inventory_add():
             "item_id": item_id,
             "message": f"已添加: {data['name']} × {data['quantity']}{data.get('unit', '个')}"
         }), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -150,7 +156,7 @@ def api_inventory_add():
 @app.route('/api/inventory/batch', methods=['POST'])
 def api_inventory_batch_add():
     """
-    批量添加库存项
+    批量添加库存项（原子操作，任一失败则全部回滚）
 
     请求：
     {
@@ -164,42 +170,46 @@ def api_inventory_batch_add():
     if not data or 'items' not in data:
         return jsonify({"error": "缺少items数组"}), 400
 
-    results = []
-    for item in data['items']:
-        try:
-            item_id = db.add_inventory_item(
-                name=item['name'],
-                category=item['category'],
-                quantity=float(item['quantity']),
-                unit=item.get('unit', '个'),
-                production_date=item.get('production_date'),
-                expiry_date=item.get('expiry_date'),
-                confidence=item.get('confidence', '高'),
-                photo_path=item.get('photo_path')
-            )
-            results.append({"item_id": item_id, "name": item['name'], "success": True})
-        except Exception as e:
-            results.append({"name": item.get('name', '未知'), "success": False, "error": str(e)})
+    try:
+        result = db.batch_add_inventory_items(data['items'])
+        success_count = len(result['success'])
+        failed_count = len(result['failed'])
 
-    success_count = sum(1 for r in results if r['success'])
-    return jsonify({
-        "success": True,
-        "total": len(data['items']),
-        "added": success_count,
-        "results": results
-    }), 201
+        if failed_count > 0:
+            return jsonify({
+                "success": False,
+                "message": f"批量添加部分失败：{success_count}成功，{failed_count}失败",
+                "total": len(data['items']),
+                "added": success_count,
+                "failed": failed_count,
+                "results": result
+            }), 400
+        else:
+            return jsonify({
+                "success": True,
+                "message": f"批量添加成功：{success_count}项",
+                "total": len(data['items']),
+                "added": success_count,
+                "results": result
+            }), 201
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/inventory/<int:item_id>', methods=['PUT'])
 def api_inventory_update(item_id):
     """
-    更新库存项
+    更新库存项（支持乐观锁）
 
     请求（所有字段可选）：
     {
         "name": "土鸡蛋",
         "quantity": 8,
-        "expiry_date": "2026-08-25"
+        "expiry_date": "2026-08-25",
+        "version": 1             // 可选，乐观锁版本号
     }
     """
     data = request.get_json()
@@ -207,10 +217,17 @@ def api_inventory_update(item_id):
         return jsonify({"error": "缺少请求数据"}), 400
 
     try:
-        db.update_inventory_item(item_id, **data)
+        version = data.pop('version', None)
+        db.update_inventory_item(item_id, version=version, **data)
         return jsonify({"success": True, "message": f"已更新库存项 #{item_id}"})
     except ValueError as e:
-        return jsonify({"error": str(e)}), 404
+        error_msg = str(e)
+        if "版本冲突" in error_msg:
+            return jsonify({"error": error_msg, "code": "VERSION_CONFLICT"}), 409
+        elif "不存在" in error_msg:
+            return jsonify({"error": error_msg}), 404
+        else:
+            return jsonify({"error": error_msg}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -232,7 +249,7 @@ def api_inventory_delete(item_id):
 @app.route('/api/inventory/deduct', methods=['POST'])
 def api_inventory_deduct():
     """
-    扣减库存
+    扣减库存（FIFO先进先出，事务保护）
 
     请求：
     {
@@ -246,11 +263,17 @@ def api_inventory_deduct():
     if not data or 'items' not in data:
         return jsonify({"error": "缺少items数组"}), 400
 
-    results = db.deduct_inventory(data['items'])
-    return jsonify({
-        "success": True,
-        "results": results
-    })
+    try:
+        results = db.deduct_inventory(data['items'])
+        return jsonify({
+            "success": True,
+            "message": "扣减成功",
+            "results": results
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/inventory/expiring', methods=['GET'])
@@ -272,8 +295,19 @@ def api_inventory_expiring():
 
 @app.route('/api/inventory/categories', methods=['GET'])
 def api_inventory_categories():
-    """获取所有库存分类"""
-    categories = db.get_inventory_categories()
+    """
+    获取分类列表
+
+    查询参数：
+    - type: "preset" 返回预设分类，"used" 返回实际使用的分类（默认preset）
+    """
+    category_type = request.args.get('type', 'preset')
+
+    if category_type == 'used':
+        categories = db.get_inventory_categories()
+    else:
+        categories = db.get_preset_categories()
+
     return jsonify({
         "categories": categories,
         "count": len(categories)

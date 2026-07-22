@@ -22,6 +22,16 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
+    # 预设分类表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inventory_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            icon TEXT DEFAULT '📦',
+            sort_order INTEGER DEFAULT 0
+        )
+    ''')
+
     # 家庭画像表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS family_profile (
@@ -40,7 +50,7 @@ def init_db():
         )
     ''')
 
-    # 冰箱库存表
+    # 冰箱库存表（带乐观锁）
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS fridge_inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,9 +62,24 @@ def init_db():
             expiry_date TEXT,
             confidence TEXT DEFAULT '高',
             photo_path TEXT,
+            version INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    ''')
+
+    # 索引优化
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_inventory_category
+        ON fridge_inventory(category)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_inventory_expiry
+        ON fridge_inventory(expiry_date)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_inventory_name_qty
+        ON fridge_inventory(name, quantity)
     ''')
 
     # 用餐计划表
@@ -118,6 +143,29 @@ def init_db():
             enabled INTEGER DEFAULT 1
         )
     ''')
+
+    # 初始化预设分类（如果为空）
+    cursor.execute('SELECT COUNT(*) FROM inventory_categories')
+    if cursor.fetchone()[0] == 0:
+        default_categories = [
+            ('蔬菜', '🥬', 1),
+            ('水果', '🍎', 2),
+            ('肉类', '🥩', 3),
+            ('海鲜', '🐟', 4),
+            ('蛋类', '🥚', 5),
+            ('乳制品', '🥛', 6),
+            ('豆制品', '🫘', 7),
+            ('主食', '🍚', 8),
+            ('调味品', '🧂', 9),
+            ('饮料', '🥤', 10),
+            ('零食', '🍪', 11),
+            ('冷冻食品', '🧊', 12),
+            ('其他', '📦', 99),
+        ]
+        cursor.executemany(
+            'INSERT INTO inventory_categories (name, icon, sort_order) VALUES (?, ?, ?)',
+            default_categories
+        )
 
     conn.commit()
     conn.close()
@@ -226,17 +274,101 @@ def clear_profile():
 
 # ==================== 冰箱库存操作 ====================
 
+# 预设分类（与数据库同步）
+DEFAULT_CATEGORIES = [
+    '蔬菜', '水果', '肉类', '海鲜', '蛋类', '乳制品',
+    '豆制品', '主食', '调味品', '饮料', '零食', '冷冻食品', '其他'
+]
+
+
+def validate_date(date_str):
+    """
+    校验日期格式
+
+    Args:
+        date_str: 日期字符串
+
+    Returns:
+        str: 格式化后的日期 (YYYY-MM-DD)
+
+    Raises:
+        ValueError: 日期格式错误
+    """
+    if not date_str:
+        return None
+
+    # 支持的格式
+    formats = ['%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d']
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+
+    raise ValueError(f"日期格式错误: {date_str}，支持格式: YYYY-MM-DD")
+
+
+def validate_category(category):
+    """
+    校验分类是否在预设列表中
+
+    Args:
+        category: 分类名称
+
+    Returns:
+        str: 校验后的分类
+
+    Raises:
+        ValueError: 分类不在预设列表中
+    """
+    if category not in DEFAULT_CATEGORIES:
+        raise ValueError(f"分类 '{category}' 不在预设列表中，可选: {', '.join(DEFAULT_CATEGORIES)}")
+    return category
+
+
 def add_inventory_item(name, category, quantity, unit='个',
                        production_date=None, expiry_date=None,
                        confidence='高', photo_path=None):
-    """添加库存项"""
+    """
+    添加库存项
+
+    Args:
+        name: 食材名称
+        category: 分类（必须在预设列表中）
+        quantity: 数量
+        unit: 单位
+        production_date: 生产日期（可选，格式 YYYY-MM-DD）
+        expiry_date: 保质期（可选，格式 YYYY-MM-DD）
+        confidence: 识别置信度
+        photo_path: 照片路径
+
+    Returns:
+        int: 新增项ID
+
+    Raises:
+        ValueError: 参数校验失败
+    """
+    # 校验
+    validate_category(category)
+    production_date = validate_date(production_date)
+    expiry_date = validate_date(expiry_date)
+
+    # 日期逻辑校验
+    if production_date and expiry_date:
+        if production_date > expiry_date:
+            raise ValueError("生产日期不能晚于保质期")
+
+    if quantity <= 0:
+        raise ValueError("数量必须大于0")
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO fridge_inventory
         (name, category, quantity, unit, production_date, expiry_date,
-         confidence, photo_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         confidence, photo_path, version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
     ''', (name, category, quantity, unit, production_date, expiry_date,
           confidence, photo_path))
     conn.commit()
@@ -245,26 +377,124 @@ def add_inventory_item(name, category, quantity, unit='个',
     return item_id
 
 
-def get_inventory(category=None):
+def batch_add_inventory_items(items):
     """
-    获取库存
+    批量添加库存项（原子操作）
+
+    Args:
+        items: 库存项列表 [{"name": "...", "category": "...", "quantity": ...}, ...]
+
+    Returns:
+        dict: {"success": [...], "failed": [...]}
+
+    Raises:
+        ValueError: 任何一项校验失败时回滚全部
+    """
+    success_items = []
+    failed_items = []
+
+    conn = get_connection()
+    try:
+        conn.execute('BEGIN')
+        cursor = conn.cursor()
+
+        for item in items:
+            try:
+                # 校验
+                category = validate_category(item.get('category', '其他'))
+                production_date = validate_date(item.get('production_date'))
+                expiry_date = validate_date(item.get('expiry_date'))
+                quantity = float(item.get('quantity', 0))
+
+                if quantity <= 0:
+                    raise ValueError("数量必须大于0")
+
+                if production_date and expiry_date and production_date > expiry_date:
+                    raise ValueError("生产日期不能晚于保质期")
+
+                cursor.execute('''
+                    INSERT INTO fridge_inventory
+                    (name, category, quantity, unit, production_date, expiry_date,
+                     confidence, photo_path, version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ''', (
+                    item['name'],
+                    category,
+                    quantity,
+                    item.get('unit', '个'),
+                    production_date,
+                    expiry_date,
+                    item.get('confidence', '高'),
+                    item.get('photo_path')
+                ))
+
+                success_items.append({
+                    "item_id": cursor.lastrowid,
+                    "name": item['name'],
+                    "success": True
+                })
+
+            except Exception as e:
+                failed_items.append({
+                    "name": item.get('name', '未知'),
+                    "success": False,
+                    "error": str(e)
+                })
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        raise ValueError(f"批量添加失败，已回滚: {str(e)}")
+
+    finally:
+        conn.close()
+
+    return {"success": success_items, "failed": failed_items}
+
+
+def get_inventory(category=None, page=1, page_size=50):
+    """
+    获取库存（分页）
 
     Args:
         category: 按分类筛选（可选）
+        page: 页码（从1开始）
+        page_size: 每页数量（默认50）
 
     Returns:
-        list: 库存项列表
+        dict: {"items": [...], "total": int, "page": int, "page_size": int, "total_pages": int}
     """
     conn = get_connection()
     cursor = conn.cursor()
 
+    # 计算总数
     if category:
         cursor.execute(
-            'SELECT * FROM fridge_inventory WHERE quantity > 0 AND category = ? ORDER BY expiry_date',
+            'SELECT COUNT(*) FROM fridge_inventory WHERE quantity > 0 AND category = ?',
             (category,)
         )
     else:
-        cursor.execute('SELECT * FROM fridge_inventory WHERE quantity > 0 ORDER BY expiry_date')
+        cursor.execute('SELECT COUNT(*) FROM fridge_inventory WHERE quantity > 0')
+
+    total = cursor.fetchone()[0]
+
+    # 分页查询
+    offset = (page - 1) * page_size
+    if category:
+        cursor.execute('''
+            SELECT * FROM fridge_inventory
+            WHERE quantity > 0 AND category = ?
+            ORDER BY expiry_date, created_at
+            LIMIT ? OFFSET ?
+        ''', (category, page_size, offset))
+    else:
+        cursor.execute('''
+            SELECT * FROM fridge_inventory
+            WHERE quantity > 0
+            ORDER BY expiry_date, created_at
+            LIMIT ? OFFSET ?
+        ''', (page_size, offset))
 
     rows = cursor.fetchall()
     conn.close()
@@ -282,28 +512,52 @@ def get_inventory(category=None):
         else:
             item['days_left'] = None
         items.append(item)
-    return items
+
+    total_pages = (total + page_size - 1) // page_size
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages
+    }
 
 
-def update_inventory_item(item_id, **kwargs):
+def update_inventory_item(item_id, version=None, **kwargs):
     """
-    更新库存项
+    更新库存项（带乐观锁）
 
     Args:
         item_id: 库存项ID
+        version: 版本号（乐观锁，不传则跳过锁检查）
         **kwargs: 要更新的字段
 
     Raises:
-        ValueError: 库存项不存在
+        ValueError: 库存项不存在或版本冲突
     """
     conn = get_connection()
     cursor = conn.cursor()
 
     # 检查是否存在
-    cursor.execute('SELECT id FROM fridge_inventory WHERE id = ?', (item_id,))
-    if not cursor.fetchone():
+    cursor.execute('SELECT id, version FROM fridge_inventory WHERE id = ?', (item_id,))
+    row = cursor.fetchone()
+    if not row:
         conn.close()
         raise ValueError(f"库存项 #{item_id} 不存在")
+
+    # 乐观锁检查
+    if version is not None and row['version'] != version:
+        conn.close()
+        raise ValueError(f"版本冲突：当前版本 {row['version']}，传入版本 {version}，请刷新后重试")
+
+    # 校验日期
+    if 'production_date' in kwargs:
+        kwargs['production_date'] = validate_date(kwargs['production_date'])
+    if 'expiry_date' in kwargs:
+        kwargs['expiry_date'] = validate_date(kwargs['expiry_date'])
+    if 'category' in kwargs:
+        validate_category(kwargs['category'])
 
     # 构建更新语句
     allowed_fields = {'name', 'category', 'quantity', 'unit', 'production_date',
@@ -320,6 +574,8 @@ def update_inventory_item(item_id, **kwargs):
         conn.close()
         raise ValueError("没有有效的更新字段")
 
+    # 更新版本号和时间
+    set_clauses.append("version = version + 1")
     set_clauses.append("updated_at = CURRENT_TIMESTAMP")
     values.append(item_id)
 
@@ -348,27 +604,46 @@ def delete_inventory_item(item_id):
         conn.close()
         raise ValueError(f"库存项 #{item_id} 不存在")
 
-    cursor.execute(
-        'UPDATE fridge_inventory SET quantity = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        (item_id,)
-    )
+    cursor.execute('''
+        UPDATE fridge_inventory
+        SET quantity = 0, version = version + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (item_id,))
     conn.commit()
     conn.close()
 
 
-def get_inventory_categories():
-    """获取所有库存分类"""
+def get_preset_categories():
+    """获取预设分类列表（从数据库）"""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT category FROM fridge_inventory WHERE quantity > 0 ORDER BY category')
+    cursor.execute('SELECT name, icon, sort_order FROM inventory_categories ORDER BY sort_order')
     rows = cursor.fetchall()
     conn.close()
-    return [row['category'] for row in rows]
+    return [dict(row) for row in rows]
+
+
+def get_inventory_categories():
+    """获取库存中实际使用的分类"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT category, COUNT(*) as count
+        FROM fridge_inventory
+        WHERE quantity > 0
+        GROUP BY category
+        ORDER BY category
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"name": row['category'], "count": row['count']} for row in rows]
 
 
 def get_inventory_summary():
     """获取库存摘要（用于Prompt）"""
-    items = get_inventory()
+    result = get_inventory(page_size=1000)  # 摘要不分页
+    items = result['items']
+
     if not items:
         return "冰箱为空"
 
@@ -389,42 +664,103 @@ def get_inventory_summary():
 
 def deduct_inventory(items_to_deduct):
     """
-    扣减库存
-    items_to_deduct: [{"name": "鸡蛋", "quantity": 2}, ...]
+    扣减库存（FIFO 先进先出 + 事务）
+
+    Args:
+        items_to_deduct: [{"name": "鸡蛋", "quantity": 2}, ...]
+
+    Returns:
+        list: 扣减结果
+
+    Raises:
+        ValueError: 库存不足时回滚
     """
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        conn.execute('BEGIN')
+        cursor = conn.cursor()
 
-    results = []
-    for item in items_to_deduct:
-        name = item['name']
-        qty = item['quantity']
+        results = []
+        for item in items_to_deduct:
+            name = item['name']
+            qty_needed = float(item['quantity'])
 
-        # 查找库存
-        cursor.execute(
-            'SELECT id, quantity FROM fridge_inventory WHERE name = ? AND quantity > 0',
-            (name,)
-        )
-        row = cursor.fetchone()
+            if qty_needed <= 0:
+                results.append({"name": name, "error": "数量必须大于0"})
+                continue
 
-        if row:
-            old_qty = row['quantity']
-            new_qty = max(0, old_qty - qty)
-            cursor.execute(
-                'UPDATE fridge_inventory SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                (new_qty, row['id'])
-            )
-            results.append({"name": name, "old": old_qty, "new": new_qty})
-        else:
-            results.append({"name": name, "old": 0, "new": 0, "error": "库存不足"})
+            # FIFO: 按生产日期排序（先买的先用）
+            cursor.execute('''
+                SELECT id, quantity, production_date, version
+                FROM fridge_inventory
+                WHERE name = ? AND quantity > 0
+                ORDER BY
+                    CASE WHEN production_date IS NOT NULL THEN 0 ELSE 1 END,
+                    production_date ASC,
+                    created_at ASC
+            ''', (name,))
 
-    conn.commit()
-    conn.close()
-    return results
+            rows = cursor.fetchall()
+            remaining = qty_needed
+            deduct_details = []
+
+            for row in rows:
+                if remaining <= 0:
+                    break
+
+                available = row['quantity']
+                deduct_qty = min(available, remaining)
+                new_qty = available - deduct_qty
+
+                cursor.execute('''
+                    UPDATE fridge_inventory
+                    SET quantity = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND version = ?
+                ''', (new_qty, row['id'], row['version']))
+
+                # 检查是否更新成功（乐观锁）
+                if cursor.rowcount == 0:
+                    conn.rollback()
+                    raise ValueError(f"并发冲突：{name} 在扣减过程中被修改，请重试")
+
+                deduct_details.append({
+                    "id": row['id'],
+                    "deducted": deduct_qty,
+                    "remaining": new_qty
+                })
+                remaining -= deduct_qty
+
+            if remaining > 0:
+                conn.rollback()
+                raise ValueError(f"库存不足：{name} 需要 {qty_needed}，实际只有 {qty_needed - remaining}")
+
+            results.append({
+                "name": name,
+                "requested": qty_needed,
+                "deducted": qty_needed,
+                "details": deduct_details
+            })
+
+        conn.commit()
+        return results
+
+    except Exception as e:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def get_expiring_items(days=3):
-    """获取即将过期的食材"""
+    """
+    获取即将过期的食材
+
+    Args:
+        days: 天数（默认3天）
+
+    Returns:
+        list: 即将过期的食材列表
+    """
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -441,7 +777,19 @@ def get_expiring_items(days=3):
 
     rows = cursor.fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+
+    items = []
+    for row in rows:
+        item = dict(row)
+        if item.get('expiry_date'):
+            try:
+                exp = datetime.strptime(item['expiry_date'], '%Y-%m-%d')
+                item['days_left'] = (exp - datetime.now()).days
+            except:
+                item['days_left'] = None
+        items.append(item)
+
+    return items
 
 
 # ==================== 用餐计划操作 ====================
