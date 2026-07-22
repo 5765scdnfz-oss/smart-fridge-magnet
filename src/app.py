@@ -5,11 +5,32 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import tempfile
+import traceback
 
 from . import database as db
 from .recognition import process_photo
 from .agent import chat, confirm_plan, handle_inventory_query
 from .intent_parser import parse_query, build_nutrition_query, build_category_query, get_suggestions, is_simple_query, extract_food_name
+
+# 日志系统
+from .logger import get_logger, log_function
+logger = get_logger('app')
+
+# 错误处理
+from .errors import (
+    AppError, BadRequestError, NotFoundError, ConflictError, InternalError,
+    format_error_response, get_status_code,
+    InventoryNotFoundError, InventoryInsufficientError, InventoryVersionConflictError,
+    InvalidCategoryError, InvalidQuantityError, InvalidDateError
+)
+
+# 输入校验
+from .validators import (
+    validate_required, validate_string, validate_number, validate_enum,
+    validate_category, validate_quantity, validate_date, validate_date_logic,
+    validate_inventory_item, validate_batch_items, validate_deduct_items,
+    validate_file_size, validate_image_type, validate_integer
+)
 
 # 通知系统
 from .notification import (
@@ -42,6 +63,68 @@ CORS(app)
 
 # 初始化数据库
 db.init_db()
+
+logger.info("Smart Fridge Magnet started")
+
+
+# ==================== 错误处理 ====================
+
+@app.errorhandler(AppError)
+def handle_app_error(error):
+    """处理应用错误"""
+    logger.warning(f"AppError: {error.code} - {error.message}")
+    response = format_error_response(error)
+    return jsonify(response), error.status_code
+
+
+@app.errorhandler(400)
+def handle_bad_request(error):
+    """处理 400 错误"""
+    logger.warning(f"Bad request: {error}")
+    return jsonify({
+        'error': '请求参数错误',
+        'code': 1001
+    }), 400
+
+
+@app.errorhandler(404)
+def handle_not_found(error):
+    """处理 404 错误"""
+    logger.warning(f"Not found: {request.path}")
+    return jsonify({
+        'error': '资源不存在',
+        'code': 1004
+    }), 404
+
+
+@app.errorhandler(405)
+def handle_method_not_allowed(error):
+    """处理 405 错误"""
+    logger.warning(f"Method not allowed: {request.method} {request.path}")
+    return jsonify({
+        'error': '请求方法不允许',
+        'code': 1001
+    }), 405
+
+
+@app.errorhandler(500)
+def handle_internal_error(error):
+    """处理 500 错误"""
+    logger.error(f"Internal error: {error}\n{traceback.format_exc()}")
+    return jsonify({
+        'error': '服务器内部错误',
+        'code': 1007
+    }), 500
+
+
+@app.errorhandler(Exception)
+def handle_unhandled_exception(error):
+    """处理未捕获的异常"""
+    logger.error(f"Unhandled exception: {error}\n{traceback.format_exc()}")
+    return jsonify({
+        'error': '服务器内部错误',
+        'code': 1007
+    }), 500
 
 
 # ==================== API 接口 ====================
@@ -282,8 +365,8 @@ def api_inventory():
     """
     fmt = request.args.get('format', 'full')
     category = request.args.get('category')
-    page = int(request.args.get('page', 1))
-    page_size = min(int(request.args.get('page_size', 50)), 200)
+    page = validate_integer(request.args.get('page', 1), 'page', min_value=1)
+    page_size = validate_integer(request.args.get('page_size', 50), 'page_size', min_value=1, max_value=200)
 
     if fmt == 'summary':
         summary = db.get_inventory_summary()
@@ -305,44 +388,41 @@ def api_inventory_add():
     请求：
     {
         "name": "鸡蛋",
-        "category": "蛋类",         // 必须在预设分类中
+        "category": "蛋类",
         "quantity": 10,
         "unit": "个",
-        "production_date": "2026-07-20",  // 可选，格式 YYYY-MM-DD
-        "expiry_date": "2026-08-20",      // 可选，格式 YYYY-MM-DD
-        "confidence": "高"                // 可选，默认"高"
+        "production_date": "2026-07-20",
+        "expiry_date": "2026-08-20",
+        "confidence": "高"
     }
     """
     data = request.get_json()
     if not data:
-        return jsonify({"error": "缺少请求数据"}), 400
+        raise BadRequestError(message="缺少请求数据")
 
-    # 必填字段校验
-    required = ['name', 'category', 'quantity']
-    for field in required:
-        if field not in data:
-            return jsonify({"error": f"缺少必填字段: {field}"}), 400
+    # 校验输入
+    validated = validate_inventory_item(data)
 
-    try:
-        item_id = db.add_inventory_item(
-            name=data['name'],
-            category=data['category'],
-            quantity=float(data['quantity']),
-            unit=data.get('unit', '个'),
-            production_date=data.get('production_date'),
-            expiry_date=data.get('expiry_date'),
-            confidence=data.get('confidence', '高'),
-            photo_path=data.get('photo_path')
-        )
-        return jsonify({
-            "success": True,
-            "item_id": item_id,
-            "message": f"已添加: {data['name']} × {data['quantity']}{data.get('unit', '个')}"
-        }), 201
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    logger.info(f"Adding inventory: {validated['name']} x {validated['quantity']}")
+
+    item_id = db.add_inventory_item(
+        name=validated['name'],
+        category=validated['category'],
+        quantity=validated['quantity'],
+        unit=validated['unit'],
+        production_date=validated['production_date'],
+        expiry_date=validated['expiry_date'],
+        confidence=validated['confidence'],
+        photo_path=data.get('photo_path')
+    )
+
+    logger.info(f"Added inventory item #{item_id}")
+
+    return jsonify({
+        "success": True,
+        "item_id": item_id,
+        "message": f"已添加: {validated['name']} × {validated['quantity']}{validated['unit']}"
+    }), 201
 
 
 @app.route('/api/inventory/batch', methods=['POST'])
@@ -360,35 +440,36 @@ def api_inventory_batch_add():
     """
     data = request.get_json()
     if not data or 'items' not in data:
-        return jsonify({"error": "缺少items数组"}), 400
+        raise BadRequestError(message="缺少items数组")
 
-    try:
-        result = db.batch_add_inventory_items(data['items'])
-        success_count = len(result['success'])
-        failed_count = len(result['failed'])
+    # 校验输入
+    validated_items = validate_batch_items(data['items'])
 
-        if failed_count > 0:
-            return jsonify({
-                "success": False,
-                "message": f"批量添加部分失败：{success_count}成功，{failed_count}失败",
-                "total": len(data['items']),
-                "added": success_count,
-                "failed": failed_count,
-                "results": result
-            }), 400
-        else:
-            return jsonify({
-                "success": True,
-                "message": f"批量添加成功：{success_count}项",
-                "total": len(data['items']),
-                "added": success_count,
-                "results": result
-            }), 201
+    logger.info(f"Batch adding {len(validated_items)} items")
 
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    result = db.batch_add_inventory_items(validated_items)
+    success_count = len(result['success'])
+    failed_count = len(result['failed'])
+
+    if failed_count > 0:
+        logger.warning(f"Batch add partially failed: {success_count} success, {failed_count} failed")
+        return jsonify({
+            "success": False,
+            "message": f"批量添加部分失败：{success_count}成功，{failed_count}失败",
+            "total": len(data['items']),
+            "added": success_count,
+            "failed": failed_count,
+            "results": result
+        }), 400
+    else:
+        logger.info(f"Batch add success: {success_count} items")
+        return jsonify({
+            "success": True,
+            "message": f"批量添加成功：{success_count}项",
+            "total": len(data['items']),
+            "added": success_count,
+            "results": result
+        }), 201
 
 
 @app.route('/api/inventory/<int:item_id>', methods=['PUT'])
@@ -401,27 +482,29 @@ def api_inventory_update(item_id):
         "name": "土鸡蛋",
         "quantity": 8,
         "expiry_date": "2026-08-25",
-        "version": 1             // 可选，乐观锁版本号
+        "version": 1
     }
     """
     data = request.get_json()
     if not data:
-        return jsonify({"error": "缺少请求数据"}), 400
+        raise BadRequestError(message="缺少请求数据")
+
+    logger.info(f"Updating inventory #{item_id}: {data}")
+
+    version = data.pop('version', None)
 
     try:
-        version = data.pop('version', None)
         db.update_inventory_item(item_id, version=version, **data)
+        logger.info(f"Updated inventory #{item_id}")
         return jsonify({"success": True, "message": f"已更新库存项 #{item_id}"})
     except ValueError as e:
         error_msg = str(e)
         if "版本冲突" in error_msg:
-            return jsonify({"error": error_msg, "code": "VERSION_CONFLICT"}), 409
+            raise InventoryVersionConflictError(item_id, version, version)
         elif "不存在" in error_msg:
-            return jsonify({"error": error_msg}), 404
+            raise InventoryNotFoundError(item_id)
         else:
-            return jsonify({"error": error_msg}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            raise BadRequestError(message=error_msg)
 
 
 @app.route('/api/inventory/<int:item_id>', methods=['DELETE'])
@@ -429,13 +512,14 @@ def api_inventory_delete(item_id):
     """
     删除库存项（软删除，设为quantity=0）
     """
+    logger.info(f"Deleting inventory #{item_id}")
+
     try:
         db.delete_inventory_item(item_id)
+        logger.info(f"Deleted inventory #{item_id}")
         return jsonify({"success": True, "message": f"已删除库存项 #{item_id}"})
     except ValueError as e:
-        return jsonify({"error": str(e)}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise InventoryNotFoundError(item_id)
 
 
 @app.route('/api/inventory/deduct', methods=['POST'])
@@ -453,19 +537,23 @@ def api_inventory_deduct():
     """
     data = request.get_json()
     if not data or 'items' not in data:
-        return jsonify({"error": "缺少items数组"}), 400
+        raise BadRequestError(message="缺少items数组")
+
+    # 校验输入
+    validated_items = validate_deduct_items(data['items'])
+
+    logger.info(f"Deducting inventory: {validated_items}")
 
     try:
-        results = db.deduct_inventory(data['items'])
+        results = db.deduct_inventory(validated_items)
+        logger.info(f"Deducted inventory: {len(results)} items")
         return jsonify({
             "success": True,
             "message": "扣减成功",
             "results": results
         })
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise InventoryInsufficientError(str(e), 0, 0)
 
 
 @app.route('/api/inventory/expiring', methods=['GET'])
