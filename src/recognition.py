@@ -1,15 +1,83 @@
 """
 食材识别模块 — 调用 MiMo v2.5 识别冰箱照片中的食材
+集成：图片预处理、模糊检测、重试机制、去重检查、置信度处理
 """
 import os
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
+
 from .mimo_client import call_mimo_vision, call_mimo_text_with_json
 from .prompts import FOOD_RECOGNITION_PROMPT
+from .image_processor import preprocess_image, cleanup_temp_files, check_image_quality
 from . import database as db
 
 
-def recognize_food(image_path):
+# ==================== 配置 ====================
+
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # 秒
+DEFAULT_SHELF_LIFE = {
+    "蔬菜": 7,
+    "水果": 14,
+    "蛋类": 30,
+    "乳制品": 7,
+    "肉类": 3,
+    "海鲜": 2,
+    "豆制品": 5,
+    "主食": 30,
+    "调味品": 180,
+    "饮料": 90,
+    "零食": 90,
+    "冷冻食品": 180,
+    "其他": 14,
+}
+
+
+# ==================== API 调用（带重试）====================
+
+def call_with_retry(func, max_retries=MAX_RETRIES, retry_delay=RETRY_DELAY):
+    """
+    带重试的 API 调用
+
+    Args:
+        func: 调用函数
+        max_retries: 最大重试次数
+        retry_delay: 重试延迟（秒）
+
+    Returns:
+        函数返回值
+
+    Raises:
+        Exception: 最后一次重试仍失败
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            result = func()
+            return result
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).lower()
+
+            # 判断是否可重试
+            if any(keyword in error_msg for keyword in ['timeout', 'rate limit', '429', '503', 'network']):
+                if attempt < max_retries - 1:
+                    delay = retry_delay * (attempt + 1)
+                    time.sleep(delay)
+                    continue
+
+            # 不可重试的错误，直接抛出
+            raise
+
+    raise last_error
+
+
+# ==================== 食材识别 ====================
+
+def recognize_food(image_path: str) -> List[Dict]:
     """
     识别图片中的食材
 
@@ -19,19 +87,19 @@ def recognize_food(image_path):
     Returns:
         list: 识别到的食材列表
     """
-    # 调用 MiMo 视觉模型
-    result = call_mimo_vision(
-        prompt=FOOD_RECOGNITION_PROMPT,
-        image_path=image_path
+    # 调用 MiMo 视觉模型（带重试）
+    result = call_with_retry(
+        lambda: call_mimo_vision(
+            prompt=FOOD_RECOGNITION_PROMPT,
+            image_path=image_path
+        )
     )
 
     # 解析返回的 JSON
     if isinstance(result, str):
         try:
-            # 尝试解析 JSON
             items = json.loads(result)
         except json.JSONDecodeError:
-            # 尝试从文本中提取 JSON
             items = extract_json_from_text(result)
     else:
         items = result
@@ -47,7 +115,7 @@ def recognize_food(image_path):
     return items
 
 
-def extract_json_from_text(text):
+def extract_json_from_text(text: str) -> List:
     """从文本中提取JSON"""
     # 尝试找 JSON 数组
     start = text.find('[')
@@ -82,47 +150,102 @@ def extract_json_from_text(text):
     return []
 
 
-def standardize_item(item):
-    """标准化食材数据"""
-    # 确保必要字段存在
-    standardized = {
-        'name': item.get('name', '未知'),
-        'category': item.get('category', '其他'),
-        'quantity': parse_number(item.get('quantity', 1)),
+# ==================== 数据标准化 ====================
+
+def standardize_item(item: Dict) -> Dict:
+    """
+    标准化食材数据
+
+    Args:
+        item: 原始食材数据
+
+    Returns:
+        dict: 标准化后的数据
+    """
+    name = item.get('name', '未知')
+    category = item.get('category', '其他')
+    confidence = item.get('confidence', '中')
+
+    # 分类校验
+    valid_categories = [
+        '蔬菜', '水果', '肉类', '海鲜', '蛋类', '乳制品',
+        '豆制品', '主食', '调味品', '饮料', '零食', '冷冻食品', '其他'
+    ]
+    if category not in valid_categories:
+        category = '其他'
+
+    # 数量解析
+    quantity = parse_number(item.get('quantity', 1))
+
+    # 日期解析
+    production_date = parse_date(item.get('production_date'))
+    expiry_date = parse_date(item.get('expiry_date'))
+
+    # 日期逻辑校验
+    if production_date and expiry_date:
+        if production_date > expiry_date:
+            production_date = None
+            expiry_date = None
+
+    # 如果没有保质期，根据分类估算
+    if not expiry_date and category in DEFAULT_SHELF_LIFE:
+        days = DEFAULT_SHELF_LIFE[category]
+        expiry_date = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d')
+
+    return {
+        'name': name,
+        'category': category,
+        'quantity': quantity,
         'unit': item.get('unit', '个'),
-        'production_date': parse_date(item.get('production_date')),
-        'expiry_date': parse_date(item.get('expiry_date')),
-        'confidence': item.get('confidence', '中')
+        'production_date': production_date,
+        'expiry_date': expiry_date,
+        'confidence': confidence,
+        'need_confirm': confidence == '低' or name == '未知',
+        'original_data': item  # 保留原始数据
     }
-    return standardized
 
 
-def parse_number(value):
+def parse_number(value) -> float:
     """解析数字"""
     if isinstance(value, (int, float)):
-        return value
+        return float(value)
     try:
-        # 移除非数字字符
         import re
+        # 尝试提取范围（如 "3-5"）
+        if isinstance(value, str) and '-' in value:
+            parts = value.split('-')
+            if len(parts) == 2:
+                return (float(parts[0]) + float(parts[1])) / 2
         nums = re.findall(r'[\d.]+', str(value))
         if nums:
             return float(nums[0])
     except:
         pass
-    return 1
+    return 1.0
 
 
-def parse_date(value):
+def parse_date(value) -> Optional[str]:
     """解析日期"""
     if not value:
         return None
 
     # 如果已经是 YYYY-MM-DD 格式
     if isinstance(value, str) and len(value) == 10 and value[4] == '-':
-        return value
+        try:
+            datetime.strptime(value, '%Y-%m-%d')
+            return value
+        except:
+            pass
 
     # 尝试其他格式
-    formats = ['%Y/%m/%d', '%Y.%m.%d', '%Y年%m月%d日', '%m/%d/%Y']
+    formats = [
+        '%Y/%m/%d',
+        '%Y.%m.%d',
+        '%Y年%m月%d日',
+        '%m/%d/%Y',
+        '%d/%m/%Y',
+        '%Y%m%d',
+    ]
     for fmt in formats:
         try:
             return datetime.strptime(str(value), fmt).strftime('%Y-%m-%d')
@@ -132,7 +255,114 @@ def parse_date(value):
     return None
 
 
-def save_to_inventory(items, photo_path=None):
+# ==================== 去重检查 ====================
+
+def check_duplicates(items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    检查与现有库存的重复
+
+    Args:
+        items: 识别到的食材列表
+
+    Returns:
+        (新食材列表, 重复食材列表)
+    """
+    existing = db.get_inventory(page_size=1000)['items']
+    existing_map = {}
+
+    for item in existing:
+        name = item['name']
+        if name not in existing_map:
+            existing_map[name] = []
+        existing_map[name].append(item)
+
+    new_items = []
+    duplicate_items = []
+
+    for item in items:
+        name = item['name']
+        if name in existing_map:
+            duplicate_items.append({
+                'new': item,
+                'existing': existing_map[name],
+                'action': 'merge'  # 默认合并
+            })
+        else:
+            new_items.append(item)
+
+    return new_items, duplicate_items
+
+
+def merge_with_existing(duplicate_items: List[Dict]) -> List[Dict]:
+    """
+    合并重复食材
+
+    Args:
+        duplicate_items: 重复食材列表
+
+    Returns:
+        list: 更新后的食材列表
+    """
+    updated = []
+
+    for dup in duplicate_items:
+        new = dup['new']
+        existing_list = dup['existing']
+
+        if dup['action'] == 'merge' and existing_list:
+            # 合并到第一个匹配项
+            exist = existing_list[0]
+            new_quantity = exist['quantity'] + new['quantity']
+
+            db.update_inventory_item(
+                exist['id'],
+                quantity=new_quantity
+            )
+
+            updated.append({
+                **exist,
+                'quantity': new_quantity,
+                'merged': True,
+                'added_quantity': new['quantity']
+            })
+
+        elif dup['action'] == 'replace' and existing_list:
+            # 替换
+            exist = existing_list[0]
+            db.update_inventory_item(
+                exist['id'],
+                quantity=new['quantity'],
+                expiry_date=new.get('expiry_date'),
+                confidence=new.get('confidence', '中')
+            )
+
+            updated.append({
+                **new,
+                'id': exist['id'],
+                'replaced': True
+            })
+
+        elif dup['action'] == 'add':
+            # 新增（即使存在）
+            item_id = db.add_inventory_item(
+                name=new['name'],
+                category=new['category'],
+                quantity=new['quantity'],
+                unit=new['unit'],
+                production_date=new.get('production_date'),
+                expiry_date=new.get('expiry_date'),
+                confidence=new.get('confidence', '中'),
+                photo_path=new.get('photo_path')
+            )
+            new['id'] = item_id
+            updated.append(new)
+
+    return updated
+
+
+# ==================== 保存到库存 ====================
+
+def save_to_inventory(items: List[Dict], photo_path: str = None) -> List[Dict]:
     """
     将识别结果保存到数据库
 
@@ -145,6 +375,10 @@ def save_to_inventory(items, photo_path=None):
     """
     saved = []
     for item in items:
+        # 跳过需要确认的低置信度项
+        if item.get('need_confirm') and not item.get('force_save'):
+            continue
+
         item_id = db.add_inventory_item(
             name=item['name'],
             category=item['category'],
@@ -161,83 +395,220 @@ def save_to_inventory(items, photo_path=None):
     return saved
 
 
-def format_recognition_result(items):
+# ==================== 格式化结果 ====================
+
+def format_recognition_result(items: List[Dict], duplicates: List[Dict] = None) -> str:
     """
     格式化识别结果为用户友好的文本
 
     Args:
         items: 食材列表
+        duplicates: 重复食材列表
 
     Returns:
         str: 格式化的文本
     """
-    if not items:
+    if not items and not duplicates:
         return "未识别到任何食材 😅"
 
-    if isinstance(items, dict) and 'error' in items:
-        return f"识别失败：{items.get('error', '未知错误')}"
+    lines = []
 
-    lines = [f"🔍 识别到 {len(items)} 种食材：\n"]
+    # 新增的食材
+    if items:
+        lines.append(f"🔍 识别到 {len(items)} 种新食材：\n")
+        for i, item in enumerate(items, 1):
+            line = f"{i}. {item['name']} × {item['quantity']}{item['unit']}"
+            if item.get('expiry_date'):
+                line += f"（保质期至 {item['expiry_date']}）"
+            if item.get('confidence') == '低':
+                line += " ⚠️识别不确定"
+            lines.append(line)
 
-    for i, item in enumerate(items, 1):
-        line = f"{i}. {item['name']} × {item['quantity']}{item['unit']}"
-        if item.get('expiry_date'):
-            line += f"（保质期至 {item['expiry_date']}）")
-        if item.get('confidence') == '低':
-            line += " ⚠️识别不确定"
-        lines.append(line)
+    # 合并的食材
+    if duplicates:
+        merged = [d for d in duplicates if d.get('merged')]
+        if merged:
+            lines.append(f"\n📦 合并到已有库存：")
+            for d in merged:
+                lines.append(f"- {d['name']} +{d['added_quantity']}{d['unit']}（现有 {d['quantity']}{d['unit']}）")
 
-    lines.append(f"\n✅ 已存入冰箱库存")
+    if items:
+        lines.append(f"\n✅ 已存入冰箱库存")
+
     return "\n".join(lines)
 
 
 # ==================== 主函数 ====================
 
-def process_photo(image_path):
+def process_photo(image_path: str, auto_save: bool = True) -> Dict:
     """
-    处理照片：识别食材并存入库存
+    处理照片：预处理 → 识别 → 去重 → 保存
+
+    Args:
+        image_path: 图片文件路径
+        auto_save: 是否自动保存（低置信度仍需确认）
+
+    Returns:
+        dict: {
+            "success": bool,
+            "items": 识别到的食材列表,
+            "duplicates": 重复食材列表,
+            "message": 用户友好的消息,
+            "quality_info": 图片质量信息,
+            "processing_info": 处理信息
+        }
+    """
+    result = {
+        "success": False,
+        "items": [],
+        "duplicates": [],
+        "new_items": [],
+        "message": "",
+        "quality_info": {},
+        "processing_info": {},
+        "need_confirm": False
+    }
+
+    # 1. 图片预处理
+    processed_path, process_info = preprocess_image(image_path)
+    result['processing_info'] = process_info
+
+    if processed_path is None:
+        result['message'] = "图片质量检查失败：\n" + "\n".join(
+            ["❌ " + e for e in process_info['quality_check']['errors']]
+        )
+        result['quality_info'] = process_info['quality_check']
+        return result
+
+    result['quality_info'] = process_info['quality_check']
+
+    try:
+        # 2. 识别食材
+        items = recognize_food(processed_path)
+
+        if isinstance(items, dict) and 'error' in items:
+            result['message'] = f"识别失败：{items.get('error')}"
+            return result
+
+        if not items:
+            result['message'] = "未识别到任何食材，请重新拍照或调整角度"
+            return result
+
+        # 3. 去重检查
+        new_items, duplicate_items = check_duplicates(items)
+
+        # 4. 合并重复项
+        if duplicate_items:
+            merged = merge_with_existing(duplicate_items)
+            result['duplicates'] = duplicate_items
+
+        # 5. 保存新项
+        if auto_save and new_items:
+            saved_items = save_to_inventory(new_items, photo_path=image_path)
+            result['items'] = saved_items
+            result['new_items'] = saved_items
+        else:
+            result['items'] = new_items
+            result['new_items'] = new_items
+            result['need_confirm'] = True
+
+        # 6. 检查是否有低置信度项
+        low_confidence = [i for i in items if i.get('need_confirm')]
+        if low_confidence:
+            result['need_confirm'] = True
+
+        # 7. 格式化结果
+        result['message'] = format_recognition_result(
+            result['new_items'],
+            result['duplicates']
+        )
+        result['success'] = True
+
+    finally:
+        # 清理临时文件
+        if processed_path != image_path:
+            cleanup_temp_files(image_path)
+
+    return result
+
+
+def process_photo_with_confirm(image_path: str) -> Dict:
+    """
+    处理照片但不自动保存（用于确认流程）
 
     Args:
         image_path: 图片文件路径
 
     Returns:
-        dict: {
-            "items": 识别到的食材列表,
-            "message": 用户友好的消息,
-            "success": 是否成功
-        }
+        dict: 识别结果（需要用户确认后保存）
     """
-    # 识别食材
-    items = recognize_food(image_path)
+    return process_photo(image_path, auto_save=False)
 
-    if isinstance(items, dict) and 'error' in items:
-        return {
-            "items": [],
-            "message": f"识别失败：{items.get('error')}",
-            "success": False
-        }
 
-    if not items:
-        return {
-            "items": [],
-            "message": "未识别到任何食材，请重新拍照或调整角度",
-            "success": False
-        }
+def confirm_and_save(items: List[Dict], photo_path: str = None) -> Dict:
+    """
+    用户确认后保存
 
-    # 保存到数据库
-    saved_items = save_to_inventory(items, photo_path=image_path)
+    Args:
+        items: 用户确认/修改后的食材列表
+        photo_path: 照照路径
 
-    # 格式化结果
-    message = format_recognition_result(saved_items)
+    Returns:
+        dict: 保存结果
+    """
+    saved = []
+    for item in items:
+        if item.get('id'):
+            # 更新已有项
+            db.update_inventory_item(
+                item['id'],
+                name=item.get('name'),
+                category=item.get('category'),
+                quantity=item.get('quantity'),
+                unit=item.get('unit'),
+                expiry_date=item.get('expiry_date')
+            )
+            saved.append(item)
+        else:
+            # 新增项
+            item_id = db.add_inventory_item(
+                name=item['name'],
+                category=item['category'],
+                quantity=item['quantity'],
+                unit=item.get('unit', '个'),
+                production_date=item.get('production_date'),
+                expiry_date=item.get('expiry_date'),
+                confidence=item.get('confidence', '中'),
+                photo_path=photo_path
+            )
+            item['id'] = item_id
+            saved.append(item)
 
     return {
-        "items": saved_items,
-        "message": message,
-        "success": True
+        "success": True,
+        "items": saved,
+        "message": f"✅ 已保存 {len(saved)} 种食材到库存"
     }
 
 
+# ==================== 测试 ====================
+
 if __name__ == '__main__':
-    # 测试
-    print("食材识别模块")
-    print("请通过 process_photo(image_path) 调用")
+    import sys
+
+    if len(sys.argv) < 2:
+        print("用法: python recognition.py <图片路径>")
+        sys.exit(1)
+
+    image_path = sys.argv[1]
+
+    print(f"处理图片: {image_path}")
+    print()
+
+    result = process_photo(image_path)
+
+    print(f"成功: {result['success']}")
+    print(f"消息: {result['message']}")
+    print(f"食材: {len(result['items'])} 种")
+    print(f"重复: {len(result['duplicates'])} 种")
+    print(f"需要确认: {result['need_confirm']}")

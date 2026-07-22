@@ -128,8 +128,104 @@ def api_recognize():
     """
     拍照识别接口
 
-    请求：multipart/form-data，包含图片文件（字段名：image）
+    请求：multipart/form-data
+    - image: 图片文件（必需）
+    - auto_save: 是否自动保存（可选，默认true）
+
+    响应：
+    {
+        "success": true,
+        "items": [...],
+        "duplicates": [...],
+        "new_items": [...],
+        "message": "识别结果消息",
+        "quality_info": {...},
+        "need_confirm": false
+    }
     """
+    if 'image' not in request.files:
+        return jsonify({"error": "请上传图片"}), 400
+
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({"error": "未选择文件"}), 400
+
+    # 获取参数
+    auto_save = request.form.get('auto_save', 'true').lower() == 'true'
+
+    # 保存临时文件
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+        file.save(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        # 处理照片
+        result = process_photo(tmp_path, auto_save=auto_save)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "message": f"识别失败：{str(e)}"
+        }), 500
+    finally:
+        # 清理临时文件
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+@app.route('/api/recognize/confirm', methods=['POST'])
+def api_recognize_confirm():
+    """
+    确认识别结果（用户修改后提交）
+
+    请求：
+    {
+        "items": [
+            {
+                "name": "鸡蛋",
+                "category": "蛋类",
+                "quantity": 6,
+                "unit": "个",
+                "expiry_date": "2026-08-20",
+                "confidence": "高",
+                "id": null  // 如果是更新已有项，传id
+            }
+        ],
+        "photo_path": "/tmp/xxx.jpg"  // 可选
+    }
+    """
+    from .recognition import confirm_and_save
+
+    data = request.get_json()
+    if not data or 'items' not in data:
+        return jsonify({"error": "缺少items数组"}), 400
+
+    try:
+        result = confirm_and_save(
+            items=data['items'],
+            photo_path=data.get('photo_path')
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/recognize/check', methods=['POST'])
+def api_recognize_check():
+    """
+    仅检查图片质量（不识别）
+
+    请求：multipart/form-data
+    - image: 图片文件
+    """
+    from .image_processor import check_image_quality
+
     if 'image' not in request.files:
         return jsonify({"error": "请上传图片"}), 400
 
@@ -143,11 +239,9 @@ def api_recognize():
         tmp_path = tmp.name
 
     try:
-        # 处理照片
-        result = process_photo(tmp_path)
+        result = check_image_quality(tmp_path)
         return jsonify(result)
     finally:
-        # 清理临时文件
         try:
             os.unlink(tmp_path)
         except:

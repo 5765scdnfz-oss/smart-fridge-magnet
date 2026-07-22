@@ -8,24 +8,48 @@ FOOD_RECOGNITION_PROMPT = """
 请仔细分析这张图片，识别其中的所有食材。
 
 对于每个食材，请返回以下信息（JSON格式）：
-- name: 食材名称（中文）
-- category: 分类（蔬菜/肉类/蛋类/乳制品/水果/主食/调味品/饮品/其他）
-- quantity: 估算数量
-- unit: 单位（个/克/盒/袋/瓶/包/斤）
-- production_date: 生产日期（如果能看到，格式YYYY-MM-DD，看不到则为null）
-- expiry_date: 保质期/到期日（如果能看到，格式YYYY-MM-DD，看不到则为null）
+- name: 食材名称（中文，如"鸡蛋"、"西红柿"）
+- category: 分类，必须是以下之一：蔬菜/水果/肉类/海鲜/蛋类/乳制品/豆制品/主食/调味品/饮料/零食/冷冻食品/其他
+- quantity: 估算数量（数字）
+- unit: 单位（个/克/盒/袋/瓶/包/斤/块/条/根/颗/把）
+- production_date: 生产日期（格式YYYY-MM-DD，看不到则为null）
+- expiry_date: 保质期/到期日（格式YYYY-MM-DD，看不到则为null）
 - confidence: 识别置信度（高/中/低）
 
-注意事项：
-1. 如果是包装食品，尽量读取包装上的日期信息
-2. 数量请根据图片中的参照物（如冰箱格子大小）进行估算
-3. 如果看不清或不确定，confidence设为"低"
-4. 返回纯JSON数组，不要其他文字
+识别规则：
+1. 只识别食材，忽略以下物品：
+   - 非食品（化妆品、药品、清洁用品等）
+   - 已做好的菜（形态变化太大，无法识别原料）
+   - 容器（盘子、碗、保鲜盒等）
 
-返回格式示例：
+2. 数量估算：
+   - 有包装的：读取包装上的数量或重量
+   - 散装的：根据可见部分估算总数，如果堆叠遮挡，给出范围如"3-5"
+   - 有参照物的：根据冰箱格子、盘子等大小估算
+
+3. 日期识别：
+   - 包装食品：尽量读取生产日期和保质期
+   - 散装食材：设为null
+   - 如果看到"保质期XX天"，根据生产日期计算
+
+4. 置信度判断：
+   - 高：清晰可见，能确定是该食材
+   - 中：大致能认出，但细节不确定
+   - 低：模糊、遮挡、或可能是其他相似食材
+
+5. 相似食材区分：
+   - 白菜 vs 娃娃菜：看大小和形状
+   - 大葱 vs 小葱：看粗细
+   - 土豆 vs 红薯：看颜色和形状
+   - 如果无法区分，confidence设为"低"
+
+返回纯JSON数组，不要其他文字。如果没有任何食材，返回空数组 []。
+
+示例：
 [
-    {"name": "鸡蛋", "category": "蛋类", "quantity": 6, "unit": "个", "production_date": null, "expiry_date": "2026-08-15", "confidence": "高"},
-    {"name": "西红柿", "category": "蔬菜", "quantity": 3, "unit": "个", "production_date": null, "expiry_date": null, "confidence": "中"}
+    {"name": "鸡蛋", "category": "蛋类", "quantity": 6, "unit": "个", "production_date": null, "expiry_date": null, "confidence": "高"},
+    {"name": "西红柿", "category": "蔬菜", "quantity": 3, "unit": "个", "production_date": null, "expiry_date": null, "confidence": "高"},
+    {"name": "牛奶", "category": "乳制品", "quantity": 1, "unit": "盒", "production_date": "2026-07-15", "expiry_date": "2026-08-15", "confidence": "高"}
 ]
 """
 
