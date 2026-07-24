@@ -4,6 +4,11 @@
 import requests
 import json
 import time
+import sys
+import io
+
+# 设置输出编码
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 BASE_URL = 'http://localhost:5000/api'
 
@@ -279,6 +284,64 @@ def demo_scheduler():
     print(f"即将过期: {data.get('expiring_count', 0)} 种")
 
 
+def demo_device_display():
+    """演示：设备显示（Wi-Fi 上屏）"""
+    import hashlib
+    import os
+
+    print_header("9. 设备显示（Wi-Fi 上屏）")
+
+    device_id = "demo-device-001"
+
+    # 创建测试 .film 文件（FrameFilm Pro 规格）
+    header = (209088).to_bytes(4, 'little') + b'\x00' * 28
+    pixels = os.urandom(209088)
+    film_data = header + pixels
+
+    print(f"\n设备 ID: {device_id}")
+    print(f"文件大小: {len(film_data)} bytes (FrameFilm Pro)")
+
+    # 上传
+    print("\n上传 .film 文件...")
+    resp = requests.post(
+        f'{BASE_URL}/devices/{device_id}/display',
+        data=film_data,
+        headers={'Content-Type': 'application/octet-stream'}
+    )
+    data = resp.json()
+
+    if data.get('success'):
+        print(f"  版本: {data['version']}")
+        print(f"  SHA-256: {data['sha256'][:16]}...")
+
+        wait()
+
+        # Manifest
+        print("\n获取 manifest（ESP32 调用）...")
+        resp = requests.get(f'{BASE_URL}/devices/{device_id}/display/manifest')
+        manifest = resp.json()
+        print(f"  版本: {manifest['version']}")
+        print(f"  大小: {manifest['size']} bytes")
+        print(f"  URL: {manifest['film_url']}")
+
+        wait()
+
+        # 同步状态
+        print("\n查看同步状态...")
+        resp = requests.get(f'{BASE_URL}/devices/{device_id}/sync-status')
+        status = resp.json()
+        print(f"  最新版本: {status['latest_version']}")
+        print(f"  事件记录: {len(status['recent_events'])} 条")
+
+        # 设备列表
+        print("\n设备列表...")
+        resp = requests.get(f'{BASE_URL}/devices')
+        devices = resp.json()
+        print(f"  已注册设备: {devices['count']} 台")
+    else:
+        print(f"  上传失败: {data.get('error')}")
+
+
 def run_demo():
     """运行演示"""
     print("🧊 智能冰箱贴 — 功能演示")
@@ -307,6 +370,9 @@ def run_demo():
         wait(2)
 
         demo_scheduler()
+        wait(2)
+
+        demo_device_display()
 
         print_header("演示完成")
         print("\n🎉 所有功能演示完毕！")

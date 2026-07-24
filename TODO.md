@@ -5,6 +5,20 @@
 
 ---
 
+## P0 设备显示路由（7/24 完成）✅
+
+- [x] `POST /api/devices/{id}/display` — Android 上传 .film
+- [x] `GET /api/devices/{id}/display/manifest` — ESP32 版本检查
+- [x] `GET /api/devices/{id}/display/{ver}.film` — ESP32 下载文件
+- [x] `GET /api/devices/{id}/sync-status` — Android 同步状态
+- [x] `GET /api/devices` — 设备列表
+- [x] `POST /api/devices/{id}/display/force` — 强制刷新
+- [x] 设备数据库表（devices, device_display, device_sync_log）
+- [x] .film 文件头验证 + SHA-256 校验
+- [x] 测试通过：上传/manifest/下载/状态
+
+---
+
 ## Day 1（7/26）：搭建基础框架 ✅
 
 - [x] 创建 Flask 主程序骨架（app.py）

@@ -1097,6 +1097,178 @@ def health_nutrition():
     return jsonify(check_nutrition())
 
 
+# ==================== 设备显示接口（Wi-Fi 上屏核心）====================
+
+from .device_display import (
+    upload_film, get_manifest, download_film,
+    get_sync_status, list_devices
+)
+
+
+@app.route('/api/devices', methods=['GET'])
+def api_devices_list():
+    """列出所有设备"""
+    devices = list_devices()
+    return jsonify({"devices": devices, "count": len(devices)})
+
+
+@app.route('/api/devices/<device_id>/display', methods=['POST'])
+def api_device_display_upload(device_id):
+    """
+    Android 上传 .film 文件
+
+    请求：application/octet-stream，body 为 .film 二进制数据
+
+    响应：
+    {
+        "success": true,
+        "version": 17,
+        "size": 209120,
+        "sha256": "...",
+        "device_id": "..."
+    }
+    """
+    # 检查 Content-Type
+    content_type = request.content_type or ''
+    if 'octet-stream' not in content_type and 'film' not in content_type:
+        return jsonify({
+            "success": False,
+            "error": f"Content-Type 必须是 application/octet-stream，当前: {content_type}"
+        }), 415
+
+    # 读取二进制数据
+    film_data = request.get_data()
+    if not film_data:
+        return jsonify({"success": False, "error": "请求体为空"}), 400
+
+    logger.info(f"Receiving film upload: device={device_id}, size={len(film_data)}")
+
+    # 调用上传逻辑
+    result = upload_film(device_id, film_data, uploaded_by='android')
+
+    if result["success"]:
+        return jsonify(result), 201
+    else:
+        # 区分错误类型
+        if "大小错误" in result.get("error", ""):
+            return jsonify(result), 413
+        elif "文件头验证失败" in result.get("error", ""):
+            return jsonify(result), 422
+        else:
+            return jsonify(result), 500
+
+
+@app.route('/api/devices/<device_id>/display/manifest', methods=['GET'])
+def api_device_manifest(device_id):
+    """
+    ESP32 获取 manifest（版本检查）
+
+    响应：
+    {
+        "version": 17,
+        "film_url": "https://...",
+        "size": 209120,
+        "sha256": "...",
+        "force": false
+    }
+    """
+    manifest = get_manifest(device_id)
+
+    if manifest is None:
+        return jsonify({
+            "error": "该设备暂无显示内容",
+            "code": 4004
+        }), 404
+
+    return jsonify(manifest)
+
+
+@app.route('/api/devices/<device_id>/display/<int:version>.film', methods=['GET'])
+def api_device_film_download(device_id, version):
+    """
+    ESP32 下载 .film 文件
+
+    响应：application/octet-stream
+    """
+    result = download_film(device_id, version)
+
+    if result is None:
+        return jsonify({
+            "error": f"版本 {version} 不存在",
+            "code": 4004
+        }), 404
+
+    file_path, file_size, sha256 = result
+
+    # 使用 send_file 发送二进制
+    from flask import send_file
+    return send_file(
+        file_path,
+        mimetype='application/octet-stream',
+        as_attachment=True,
+        download_name=f"{version}.film"
+    )
+
+
+@app.route('/api/devices/<device_id>/sync-status', methods=['GET'])
+def api_device_sync_status(device_id):
+    """
+    Android 查看设备同步状态
+
+    响应：
+    {
+        "device_id": "...",
+        "latest_version": 17,
+        "latest_upload_time": "...",
+        "latest_sha256": "...",
+        "last_manifest_query": "...",
+        "recent_events": [...]
+    }
+    """
+    status = get_sync_status(device_id)
+    return jsonify(status)
+
+
+@app.route('/api/devices/<device_id>/display/force', methods=['POST'])
+def api_device_display_force(device_id):
+    """
+    强制设备立即应用当前版本（不更新版本号）
+    """
+    from .database import get_connection
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute('''
+            SELECT MAX(version) FROM device_display WHERE device_id = ?
+        ''', (device_id,))
+        row = cursor.fetchone()
+
+        if not row or not row[0]:
+            return jsonify({"error": "设备无显示版本"}), 404
+
+        current_version = row[0]
+
+        # 记录强制刷新事件
+        cursor.execute('''
+            INSERT INTO device_sync_log (device_id, event_type, version, detail)
+            VALUES (?, ?, ?, ?)
+        ''', (device_id, 'force_refresh', current_version, "manual force refresh"))
+
+        conn.commit()
+
+        return jsonify({
+            "success": True,
+            "device_id": device_id,
+            "forced_version": current_version,
+            "message": "设备应在下次 manifest 查询时强制应用"
+        })
+
+    finally:
+        conn.close()
+
+
 # ==================== 启动 ====================
 
 def start_app(host='0.0.0.0', port=5000, debug=True):
